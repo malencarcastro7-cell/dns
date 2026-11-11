@@ -241,8 +241,20 @@ servico_ativo() {
 
 servico_existe() {
     local nome=$1
-    if tem_systemd; then systemctl list-unit-files "${nome}.service" 2>/dev/null | grep -q "^${nome}.service"
+    # "systemctl cat" não usa pipe (evita falso negativo com "set -o pipefail")
+    if tem_systemd; then systemctl cat "${nome}.service" >/dev/null 2>&1
     else [[ -x /etc/init.d/$nome ]]; fi
+}
+
+# Nome real da unidade no systemd (ex.: o apelido "bind9" vira "named").
+# O "systemctl enable" não aceita apelidos (alias).
+servico_real() {
+    local nome=$1 id
+    if tem_systemd; then
+        id=$(systemctl show -p Id --value "${nome}.service" 2>/dev/null || true)
+        [[ -n $id ]] && nome=${id%.service}
+    fi
+    echo "$nome"
 }
 
 # Copia um arquivo/diretório para a pasta de backup antes de alterá-lo
@@ -736,7 +748,7 @@ configurar_ip_fixo() {
     titulo "Configuração de IP fixo (estático) em ${IFACE}"
     local cidr="${IP_SERVIDOR}/${MASCARA}"
 
-    if command -v nmcli >/dev/null && nmcli -t -f RUNNING general 2>/dev/null | grep -q running; then
+    if command -v nmcli >/dev/null && grep -q running <<<"$(nmcli -t -f RUNNING general 2>/dev/null)"; then
         ip_fixo_networkmanager "$cidr"
     elif command -v netplan >/dev/null && [[ -d /etc/netplan ]]; then
         ip_fixo_netplan "$cidr"
@@ -748,7 +760,7 @@ configurar_ip_fixo() {
     fi
 
     sleep 2
-    if ip -4 -o addr show dev "$IFACE" | grep -q "inet ${cidr} "; then
+    if grep -q "inet ${cidr} " <<<"$(ip -4 -o addr show dev "$IFACE")"; then
         sucesso "IP fixo ${cidr} ativo na interface ${IFACE}."
     else
         erro "O IP ${cidr} não ficou ativo na interface ${IFACE}. Verifique o log: ${LOG}"
@@ -823,6 +835,7 @@ instalar_pacotes() {
 
         # Nome do serviço do BIND: 'named' (versões novas) ou 'bind9' (antigas)
         if servico_existe named; then BIND_SERVICO="named"; else BIND_SERVICO="bind9"; fi
+        BIND_SERVICO=$(servico_real "$BIND_SERVICO")
     else
         executar "Instalando ferramentas auxiliares..." "$GERENCIADOR" -y install curl wget unzip tar
         executar "Instalando o servidor DNS BIND (bind, bind-utils)..." "$GERENCIADOR" -y install bind bind-utils
@@ -1156,7 +1169,7 @@ publicar_template() {
 # ---------------------------------------------------------------------------
 configurar_firewall() {
     titulo "Liberação das portas no firewall (DNS 53, HTTP 80, HTTPS 443)"
-    if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
+    if command -v ufw >/dev/null && grep -q "Status: active" <<<"$(ufw status 2>/dev/null)"; then
         executar "Liberando porta 53 (DNS) no UFW..."     ufw allow 53
         executar "Liberando porta 80 (HTTP) no UFW..."    ufw allow 80/tcp
         executar "Liberando porta 443 (HTTPS) no UFW..."  ufw allow 443/tcp
@@ -1177,6 +1190,8 @@ configurar_firewall() {
 habilitar_inicializacao() {
     titulo "Inicialização automática dos serviços (DNS e Web) junto com o sistema"
     local s
+    BIND_SERVICO=$(servico_real "$BIND_SERVICO")
+    WEB_SERVICO=$(servico_real "$WEB_SERVICO")
     for s in "$BIND_SERVICO" "$WEB_SERVICO"; do
         if tem_systemd; then
             executar "Habilitando '${s}' no boot (systemctl enable ${s})..." systemctl enable "$s"
@@ -1307,7 +1322,7 @@ testar() {
     fi
 
     info "Testando IP fixo e serviços..."
-    if ip -4 -o addr show dev "$IFACE" | grep -q "inet ${IP_SERVIDOR}/${MASCARA} "; then
+    if grep -q "inet ${IP_SERVIDOR}/${MASCARA} " <<<"$(ip -4 -o addr show dev "$IFACE")"; then
         sucesso "IP fixo ${IP_SERVIDOR}/${MASCARA} ativo em ${IFACE}."
     else
         aviso "IP fixo não encontrado em ${IFACE}."; falhas=$((falhas + 1))
