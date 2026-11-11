@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #==============================================================================
 #  Script ....: instala_dns_web.sh
-#  Versão ....: 1.0
+#  Versão ....: 2.0
 #  Autor .....: Matheus Alencar - RM 572185
 #
 #  OBJETIVO
@@ -12,6 +12,14 @@
 #      2. Um servidor Web (Apache ou NGINX, à escolha do usuário);
 #      3. A publicação de um template HTML baixado da Internet como página
 #         padrão do servidor Web.
+#
+#  SEGURANÇA E BOAS PRÁTICAS APLICADAS
+#    - IP fixo (estático) na interface escolhida para o servidor;
+#    - Ocultação da versão do Apache/NGINX no cabeçalho HTTP (ServerTokens Prod);
+#    - DNS sem consultas recursivas e sem transferência de zona (allow-transfer none);
+#    - Serviços DNS e HTTP habilitados para iniciar junto com o sistema;
+#    - Reinicialização (reboot) automática somente se TODAS as etapas e testes
+#      forem concluídos com sucesso.
 #
 #  DISTRIBUIÇÕES SUPORTADAS
 #    - Família Debian: Debian, Ubuntu, Linux Mint, Kali (apt-get)
@@ -30,7 +38,7 @@
 #    2. Funções de saída na tela (info / aviso / erro / sucesso)
 #    3. Funções utilitárias (perguntas, validações, serviços)
 #    4. Etapas da automação (uma função por etapa)
-#    5. Tarefas adicionais (espaço reservado para o dia da Global)
+#    5. Tarefas adicionais (opcional)
 #    6. Fluxo principal (main)
 #==============================================================================
 
@@ -68,8 +76,12 @@ CRIAR_REVERSA="s"
 CONFIGURAR_RESOLVER="s"
 MODO_PASSO_A_PASSO="n"
 ZONA_REVERSA=""
+IFACE=""                # interface de rede que recebe o IP fixo
+MASCARA="24"            # máscara em CIDR
+GATEWAY=""              # gateway da interface (opcional se não for a de Internet)
+FALHAS_TESTES=0         # contador de falhas nos testes (decide o reboot)
 ETAPA_ATUAL=0
-TOTAL_ETAPAS=9
+TOTAL_ETAPAS=12
 
 # Registros DNS informados pelo usuário (vetores paralelos)
 declare -a REG_NOME=() REG_TIPO=() REG_VALOR=() REG_PRIO=()
@@ -286,11 +298,12 @@ ${CIANO}######################################################################
 
 Este script irá, de forma automática:
   ${VERDE}1.${RESET} Verificar o ambiente (usuário root, distribuição, Internet);
-  ${VERDE}2.${RESET} Solicitar o domínio, os tipos de registro DNS e seus endereços;
-  ${VERDE}3.${RESET} Instalar o BIND e o servidor Web escolhido (Apache ou NGINX);
-  ${VERDE}4.${RESET} Criar a zona DNS direta (e, se desejado, a reversa);
-  ${VERDE}5.${RESET} Baixar um template HTML da Internet e publicá-lo como página padrão;
-  ${VERDE}6.${RESET} Liberar as portas no firewall e testar tudo ao final.
+  ${VERDE}2.${RESET} Solicitar a rede, o domínio, os tipos de registro DNS e seus endereços;
+  ${VERDE}3.${RESET} Configurar IP fixo (estático) no servidor;
+  ${VERDE}4.${RESET} Instalar o BIND e o servidor Web escolhido (Apache ou NGINX);
+  ${VERDE}5.${RESET} Criar a zona DNS (sem recursão e sem transferência de zona);
+  ${VERDE}6.${RESET} Ocultar a versão do servidor Web e publicar um template HTML da Internet;
+  ${VERDE}7.${RESET} Habilitar DNS e Web no boot, testar tudo e reiniciar o servidor.
 
 ${AMARELO}Atenção:${RESET} arquivos de configuração existentes serão salvos em backup antes
 de qualquer alteração. Pressione Ctrl+C a qualquer momento para cancelar.
@@ -455,6 +468,68 @@ pedir_url_template() {
     done
 }
 
+# Lista as interfaces de rede e pergunta qual receberá o IP fixo do servidor,
+# além do IP, da máscara e do gateway.
+coletar_rede() {
+    local -a ifaces=()
+    local i nome ip_atual padrao="" iface_rota gw_rota opcao mascara_atual
+    # Ignora interfaces virtuais (loopback, bridges, túneis, contêineres)
+    mapfile -t ifaces < <(ip -o link show | awk -F': ' '{print $2}' | cut -d@ -f1 \
+        | grep -vE '^(lo|ifb|docker|virbr|veth|br-|tun|tap|wg|sit|ip6tnl|tunl|gre|erspan|dummy|vboxnet)')
+    (( ${#ifaces[@]} > 0 )) || { erro "Nenhuma interface de rede encontrada."; exit 1; }
+    iface_rota=$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+    gw_rota=$(ip -4 route show default 2>/dev/null | awk '{print $3; exit}')
+
+    echo
+    echo "  Interfaces de rede encontradas:"
+    for i in "${!ifaces[@]}"; do
+        nome=${ifaces[$i]}
+        ip_atual=$(ip -4 -o addr show dev "$nome" 2>/dev/null | awk '{print $4; exit}')
+        printf '    %s%d)%s %-10s %-20s %s\n' "$NEGRITO" $((i + 1)) "$RESET" "$nome" "${ip_atual:-sem IP}" \
+            "$([[ $nome == "$iface_rota" ]] && echo '(saída para a Internet)')"
+        # Sugere a primeira interface que não é a de Internet (ex.: Host-only)
+        [[ -z $padrao && $nome != "$iface_rota" ]] && padrao=$((i + 1))
+    done
+    [[ -z $padrao ]] && padrao=1
+
+    while true; do
+        perguntar opcao "Interface que receberá o IP fixo do servidor (número)" "$padrao"
+        if [[ $opcao =~ ^[0-9]+$ ]] && (( opcao >= 1 && opcao <= ${#ifaces[@]} )); then
+            IFACE=${ifaces[$((opcao - 1))]}; break
+        fi
+        aviso "Opção inválida."
+    done
+
+    ip_atual=$(ip -4 -o addr show dev "$IFACE" 2>/dev/null | awk '{print $4; exit}')
+    mascara_atual=${ip_atual#*/}; [[ $ip_atual == */* ]] || mascara_atual=24
+    while true; do
+        perguntar IP_SERVIDOR "IP fixo do servidor (DNS/Web) na interface ${IFACE}" "${ip_atual%/*}"
+        ipv4_valido "$IP_SERVIDOR" && break
+        aviso "Endereço IPv4 inválido."
+    done
+    while true; do
+        perguntar MASCARA "Máscara em CIDR (24 = 255.255.255.0)" "$mascara_atual"
+        [[ $MASCARA =~ ^[0-9]+$ ]] && (( MASCARA >= 8 && MASCARA <= 30 )) && break
+        aviso "Máscara inválida. Use um número entre 8 e 30."
+    done
+
+    if [[ $IFACE == "$iface_rota" ]]; then
+        # Interface de Internet: o gateway é obrigatório para não perder a conexão
+        while true; do
+            perguntar GATEWAY "Gateway da interface ${IFACE}" "$gw_rota"
+            ipv4_valido "$GATEWAY" && break
+            aviso "Gateway inválido (obrigatório nesta interface)."
+        done
+    else
+        while true; do
+            perguntar GATEWAY "Gateway (Enter = nenhum; a Internet segue pela outra interface)" ""
+            [[ -z $GATEWAY ]] || ipv4_valido "$GATEWAY" && break
+            aviso "Gateway inválido."
+        done
+    fi
+    sucesso "Rede: ${IFACE} -> ${IP_SERVIDOR}/${MASCARA}${GATEWAY:+ (gateway ${GATEWAY})}"
+}
+
 coletar_informacoes() {
     REG_NOME=(); REG_TIPO=(); REG_VALOR=(); REG_PRIO=()
 
@@ -488,15 +563,8 @@ coletar_informacoes() {
     done
     sucesso "Domínio: ${DOMINIO}"
 
-    # --- IP do servidor (sugere o IP da interface principal) ---
-    local ip_detectado
-    ip_detectado=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)
-    [[ -z $ip_detectado ]] && ip_detectado=$(hostname -I 2>/dev/null | awk '{print $1}' || true)
-    while true; do
-        perguntar IP_SERVIDOR "Endereço IPv4 deste servidor (DNS/Web)" "${ip_detectado:-}"
-        ipv4_valido "$IP_SERVIDOR" && break
-        aviso "Endereço IPv4 inválido."
-    done
+    # --- Interface de rede e IP fixo do servidor ---
+    coletar_rede
 
     # Registro obrigatório do próprio servidor de nomes (ns1)
     adicionar_registro "ns1" "A" "$IP_SERVIDOR"
@@ -538,7 +606,9 @@ mostrar_resumo() {
     printf '%s---------------------------- RESUMO ----------------------------%s\n' "$NEGRITO" "$RESET"
     echo "  Servidor Web:          ${WEB^^}"
     echo "  Domínio:               ${DOMINIO}"
-    echo "  IP do servidor:        ${IP_SERVIDOR}"
+    echo "  Interface (IP fixo):   ${IFACE}"
+    echo "  IP fixo do servidor:   ${IP_SERVIDOR}/${MASCARA}"
+    echo "  Gateway:               ${GATEWAY:-nenhum}"
     echo "  Template HTML:         ${URL_TEMPLATE}"
     echo "  Zona reversa:          $([[ $CRIAR_REVERSA == s ]] && echo sim || echo não)"
     echo "  Usar DNS local:        $([[ $CONFIGURAR_RESOLVER == s ]] && echo sim || echo não)"
@@ -570,7 +640,162 @@ etapa_coleta() {
 }
 
 # ---------------------------------------------------------------------------
-# ETAPA 3 - Instalação dos pacotes
+# ETAPA 3 - Configuração de IP fixo (estático)
+#   Detecta o gerenciador de rede da distribuição e grava a configuração de
+#   forma permanente (vale também após reiniciar):
+#     - ifupdown (Debian)  -> /etc/network/interfaces
+#     - netplan (Ubuntu)   -> /etc/netplan/99-ip-fixo-<interface>.yaml
+#     - NetworkManager     -> nmcli (RHEL, Fedora, desktops)
+# ---------------------------------------------------------------------------
+
+# Remove de um arquivo do ifupdown o bloco (auto/allow-hotplug/iface) da interface
+remover_bloco_interface() {
+    local arquivo=$1 tmp
+    tmp=$(mktemp)
+    awk -v ifc="$IFACE" '
+        $1 == "auto" || $1 == "allow-hotplug" {
+            linha = $1; n = 0
+            for (i = 2; i <= NF; i++) if ($i != ifc) { linha = linha " " $i; n++ }
+            pular = 0
+            if (n > 0) print linha
+            next
+        }
+        $1 == "iface" { if ($2 == ifc) { pular = 1; next } else pular = 0 }
+        pular && /^[[:space:]]+[^[:space:]]/ { next }
+        pular && NF > 0 { pular = 0 }
+        { print }
+    ' "$arquivo" >"$tmp"
+    cat "$tmp" >"$arquivo"
+    rm -f "$tmp"
+}
+
+ip_fixo_ifupdown() {
+    local cidr=$1 arq
+    info "Gerenciador de rede detectado: ifupdown (/etc/network/interfaces)."
+    fazer_backup /etc/network/interfaces
+    for arq in /etc/network/interfaces /etc/network/interfaces.d/*; do
+        [[ -f $arq ]] || continue
+        grep -qE "^[[:space:]]*(auto|allow-hotplug|iface)[[:space:]].*\b${IFACE}\b" "$arq" || continue
+        fazer_backup "$arq"
+        remover_bloco_interface "$arq"
+        info "Configuração anterior (DHCP) de ${IFACE} removida de ${arq}."
+    done
+
+    {
+        echo ""
+        echo "# IP fixo do servidor DNS/Web - configurado por instala_dns_web.sh"
+        echo "auto ${IFACE}"
+        echo "iface ${IFACE} inet static"
+        echo "    address ${cidr}"
+        [[ -n $GATEWAY ]] && echo "    gateway ${GATEWAY}"
+    } >>/etc/network/interfaces
+    info "IP fixo gravado em /etc/network/interfaces."
+
+    # Encerra um cliente DHCP que esteja controlando a interface (ex.: 'dhclient enp0s8')
+    pkill -f "dhclient.*[[:space:]]${IFACE}([[:space:]]|$)" 2>/dev/null || true
+    executar "Removendo os endereços antigos de ${IFACE}..." ip addr flush dev "$IFACE"
+    executar "Ativando ${IFACE} com o IP fixo (ifup)..." ifup --force "$IFACE"
+}
+
+ip_fixo_netplan() {
+    local cidr=$1 arq="/etc/netplan/99-ip-fixo-${IFACE}.yaml"
+    info "Gerenciador de rede detectado: netplan."
+    {
+        echo "# IP fixo do servidor DNS/Web - configurado por instala_dns_web.sh"
+        echo "network:"
+        echo "  version: 2"
+        echo "  ethernets:"
+        echo "    ${IFACE}:"
+        echo "      dhcp4: false"
+        echo "      addresses: [${cidr}]"
+        if [[ -n $GATEWAY ]]; then
+            echo "      routes:"
+            echo "        - to: default"
+            echo "          via: ${GATEWAY}"
+        fi
+    } >"$arq"
+    chmod 600 "$arq"
+    info "IP fixo gravado em ${arq}."
+    executar "Aplicando a configuração (netplan apply)..." netplan apply
+}
+
+ip_fixo_networkmanager() {
+    local cidr=$1 con
+    info "Gerenciador de rede detectado: NetworkManager."
+    con=$(nmcli -g GENERAL.CONNECTION device show "$IFACE" 2>/dev/null || true)
+    if [[ -z $con || $con == "--" ]]; then
+        con="ip-fixo-${IFACE}"
+        executar "Criando a conexão '${con}'..." nmcli con add type ethernet ifname "$IFACE" con-name "$con"
+    fi
+    executar "Gravando o IP fixo na conexão '${con}'..." \
+        nmcli con mod "$con" ipv4.method manual ipv4.addresses "$cidr" ipv4.gateway "${GATEWAY}"
+    executar "Reativando a conexão '${con}'..." nmcli con up "$con"
+}
+
+configurar_ip_fixo() {
+    titulo "Configuração de IP fixo (estático) em ${IFACE}"
+    local cidr="${IP_SERVIDOR}/${MASCARA}"
+
+    if command -v nmcli >/dev/null && nmcli -t -f RUNNING general 2>/dev/null | grep -q running; then
+        ip_fixo_networkmanager "$cidr"
+    elif command -v netplan >/dev/null && [[ -d /etc/netplan ]]; then
+        ip_fixo_netplan "$cidr"
+    elif [[ -f /etc/network/interfaces ]] && command -v ifup >/dev/null; then
+        ip_fixo_ifupdown "$cidr"
+    else
+        erro "Nenhum gerenciador de rede suportado foi encontrado (ifupdown, netplan ou NetworkManager)."
+        exit 1
+    fi
+
+    sleep 2
+    if ip -4 -o addr show dev "$IFACE" | grep -q "inet ${cidr} "; then
+        sucesso "IP fixo ${cidr} ativo na interface ${IFACE}."
+    else
+        erro "O IP ${cidr} não ficou ativo na interface ${IFACE}. Verifique o log: ${LOG}"
+        exit 1
+    fi
+
+    # Confere se a Internet continua acessível (necessária para baixar pacotes)
+    if curl -s -o /dev/null --max-time 8 https://github.com 2>/dev/null \
+       || getent hosts deb.debian.org >/dev/null 2>&1; then
+        sucesso "Acesso à Internet continua funcionando."
+    else
+        aviso "Sem acesso à Internet após a configuração de rede."
+        confirmar "Deseja continuar mesmo assim?" n || exit 1
+    fi
+}
+
+# Debian instalado pelo DVD deixa o próprio DVD (cdrom:) como repositório.
+# Sem o disco no drive, o "apt-get update" falha. Esta função desativa essas
+# linhas e, se não sobrar nenhum repositório, adiciona os oficiais da Internet.
+desativar_repositorio_cdrom() {
+    local arq alterou="n"
+    for arq in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do
+        [[ -f $arq ]] || continue
+        grep -qE '^[[:space:]]*deb(-src)?[[:space:]]+(\[[^]]*\][[:space:]]+)?cdrom:' "$arq" || continue
+        fazer_backup "$arq"
+        sed -i -E 's/^([[:space:]]*deb(-src)?[[:space:]]+(\[[^]]*\][[:space:]]+)?cdrom:)/# \1/' "$arq"
+        aviso "Repositório do CD/DVD de instalação desativado em ${arq}."
+        alterou="s"
+    done
+    [[ $alterou == "s" ]] || return 0
+
+    # Se não restou nenhum repositório ativo, adiciona os oficiais do Debian
+    if ! grep -qsE '^[[:space:]]*deb[[:space:]]' /etc/apt/sources.list /etc/apt/sources.list.d/*.list \
+       && ! grep -qsE '^[[:space:]]*Types:' /etc/apt/sources.list.d/*.sources \
+       && [[ ${ID:-} == "debian" && -n ${VERSION_CODENAME:-} ]]; then
+        cat >>/etc/apt/sources.list <<EOF2
+# Repositórios oficiais adicionados por instala_dns_web.sh
+deb http://deb.debian.org/debian ${VERSION_CODENAME} main contrib non-free-firmware
+deb http://deb.debian.org/debian ${VERSION_CODENAME}-updates main contrib non-free-firmware
+deb http://security.debian.org/debian-security ${VERSION_CODENAME}-security main contrib non-free-firmware
+EOF2
+        aviso "Nenhum repositório da Internet estava configurado; os repositórios oficiais do Debian foram adicionados."
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# ETAPA 4 - Instalação dos pacotes
 # ---------------------------------------------------------------------------
 instalar_pacotes() {
     titulo "Instalação dos pacotes (BIND + ${WEB^^})"
@@ -579,6 +804,7 @@ instalar_pacotes() {
     if [[ $FAMILIA == "debian" ]]; then
         export DEBIAN_FRONTEND=noninteractive
         local apt_opts=(-y -q -o DPkg::Lock::Timeout=300)
+        desativar_repositorio_cdrom
         executar "Atualizando a lista de pacotes (apt-get update)..." apt-get "${apt_opts[@]}" update
         executar "Instalando ferramentas auxiliares (curl, wget, unzip)..." \
             apt-get "${apt_opts[@]}" install curl wget unzip tar ca-certificates iproute2
@@ -607,7 +833,7 @@ instalar_pacotes() {
 }
 
 # ---------------------------------------------------------------------------
-# ETAPA 4 - Configuração do DNS (BIND)
+# ETAPA 5 - Configuração do DNS (BIND)
 # ---------------------------------------------------------------------------
 
 # Gera o arquivo da zona direta
@@ -685,21 +911,24 @@ configurar_bind() {
         fazer_backup /etc/bind/named.conf.options
         fazer_backup /etc/bind/named.conf.local
 
-        info "Gravando opções globais em /etc/bind/named.conf.options..."
+        info "Gravando opções globais em /etc/bind/named.conf.options (recursion no; allow-transfer none)..."
         cat >/etc/bind/named.conf.options <<'EOF'
 // Gerado por instala_dns_web.sh (original salvo no diretório de backup)
 options {
     directory "/var/cache/bind";
 
-    // Responde a consultas de qualquer cliente para as zonas locais
+    // Responde a consultas de qualquer cliente, apenas para as zonas locais
     allow-query     { any; };
     listen-on       { any; };
     listen-on-v6    { any; };
 
-    // Recursão (Internet) somente para a própria máquina e redes locais
-    recursion yes;
-    allow-recursion { localhost; localnets; };
-    forwarders      { 8.8.8.8; 1.1.1.1; };
+    // SEGURANÇA: servidor somente autoritativo
+    recursion no;                   // impede consultas recursivas
+    allow-recursion { none; };      // (reforço) ninguém pode usar recursão
+    allow-transfer  { none; };      // proíbe transferência de zona (AXFR/IXFR)
+
+    // Oculta a versão do BIND (consulta "version.bind")
+    version "nao disponivel";
 
     dnssec-validation auto;
 };
@@ -711,18 +940,20 @@ EOF
         info "Salvando backup do /etc/named.conf original..."
         fazer_backup /etc/named.conf
 
-        info "Liberando consultas de outros hosts no /etc/named.conf..."
+        info "Ajustando /etc/named.conf (consultas externas, sem recursão, sem transferência)..."
         sed -i -E 's/listen-on port 53 \{[^}]*\};/listen-on port 53 { any; };/' /etc/named.conf
         sed -i -E 's/listen-on-v6 port 53 \{[^}]*\};/listen-on-v6 port 53 { any; };/' /etc/named.conf
         sed -i -E 's/allow-query[[:space:]]+\{[^}]*\};/allow-query     { any; };/' /etc/named.conf
-        grep -q 'allow-recursion' /etc/named.conf \
-            || sed -i '/^options[[:space:]]*{/a\        allow-recursion { localhost; localnets; };' /etc/named.conf
+        # SEGURANÇA: sem recursão e sem transferência de zona
+        sed -i -E 's/recursion[[:space:]]+yes;/recursion no;/' /etc/named.conf
+        grep -q 'allow-transfer' /etc/named.conf \
+            || sed -i '/^options[[:space:]]*{/a\        allow-transfer { none; };' /etc/named.conf
     fi
 
     info "Criando a zona direta em ${arquivo_zona}..."
     gerar_zona_direta "$arquivo_zona" "$serial"
 
-    info "Declarando as zonas em ${arquivo_conf_zonas}..."
+    info "Declarando as zonas em ${arquivo_conf_zonas} (com allow-transfer { none; })..."
     {
         echo "// Zonas do domínio ${DOMINIO} - gerado por instala_dns_web.sh"
         echo "zone \"${DOMINIO}\" {"
@@ -767,7 +998,6 @@ EOF
     fi
     sucesso "Arquivos de configuração do DNS válidos."
 
-    executar "Habilitando o serviço ${BIND_SERVICO} na inicialização..." servico enable "$BIND_SERVICO" || true
     executar "Reiniciando o serviço ${BIND_SERVICO}..." servico restart "$BIND_SERVICO"
     sleep 2
     servico_ativo "$BIND_SERVICO" && sucesso "Servidor DNS em execução." \
@@ -775,7 +1005,7 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# ETAPA 5 - Configuração do servidor Web
+# ETAPA 6 - Configuração do servidor Web (com versão oculta)
 # ---------------------------------------------------------------------------
 configurar_web() {
     titulo "Configuração do servidor Web (${WEB^^})"
@@ -785,27 +1015,51 @@ configurar_web() {
     ajustar_ipv6_nginx
 
     if [[ $WEB == "apache" ]]; then
-        # Define o ServerName (remove o aviso 'Could not reliably determine...')
+        # ServerName (remove o aviso 'Could not reliably determine...') e
+        # ServerTokens Prod / ServerSignature Off (oculta versão e sistema
+        # no cabeçalho HTTP "Server:" e nas páginas de erro)
         if [[ $FAMILIA == "debian" ]]; then
             echo "ServerName ${DOMINIO}" >/etc/apache2/conf-available/servername.conf
             executar "Habilitando o ServerName ${DOMINIO} no Apache..." a2enconf servername
+            fazer_backup /etc/apache2/conf-available/security.conf
+            info "Aplicando ServerTokens Prod e ServerSignature Off..."
+            sed -i -E 's/^[[:space:]]*ServerTokens[[:space:]].*/ServerTokens Prod/; s/^[[:space:]]*ServerSignature[[:space:]].*/ServerSignature Off/' \
+                /etc/apache2/conf-available/security.conf
+            grep -q '^ServerTokens Prod' /etc/apache2/conf-available/security.conf \
+                || echo "ServerTokens Prod" >>/etc/apache2/conf-available/security.conf
+            a2enconf security >>"$LOG" 2>&1 || true
+            # Também no arquivo principal (apache2.conf), como feito em aula
+            if ! grep -q '^ServerTokens Prod' /etc/apache2/apache2.conf; then
+                fazer_backup /etc/apache2/apache2.conf
+                printf '\n# Oculta a versão do Apache no cabeçalho HTTP (instala_dns_web.sh)\nServerTokens Prod\nServerSignature Off\n' \
+                    >>/etc/apache2/apache2.conf
+                info "Diretiva 'ServerTokens Prod' adicionada ao final de /etc/apache2/apache2.conf."
+            fi
             executar "Validando a configuração do Apache..." apache2ctl configtest
         else
-            echo "ServerName ${DOMINIO}" >/etc/httpd/conf.d/servername.conf
+            printf 'ServerName %s\nServerTokens Prod\nServerSignature Off\n' "$DOMINIO" >/etc/httpd/conf.d/servername.conf
             executar "Validando a configuração do Apache..." httpd -t
         fi
     else
+        # Oculta a versão do NGINX no cabeçalho HTTP e nas páginas de erro
+        if grep -qE '^[[:space:]]*#[[:space:]]*server_tokens[[:space:]]+off' /etc/nginx/nginx.conf; then
+            fazer_backup /etc/nginx/nginx.conf
+            sed -i -E 's/^([[:space:]]*)#[[:space:]]*(server_tokens[[:space:]]+off;)/\1\2/' /etc/nginx/nginx.conf
+            info "Diretiva 'server_tokens off' ativada em /etc/nginx/nginx.conf."
+        elif ! grep -qE '^[[:space:]]*server_tokens[[:space:]]+off' /etc/nginx/nginx.conf /etc/nginx/conf.d/*.conf 2>/dev/null; then
+            echo "server_tokens off;" >/etc/nginx/conf.d/seguranca.conf
+            info "Diretiva 'server_tokens off' gravada em /etc/nginx/conf.d/seguranca.conf."
+        fi
         executar "Validando a configuração do NGINX..." nginx -t
     fi
 
-    executar "Habilitando o serviço ${WEB_SERVICO} na inicialização..." servico enable "$WEB_SERVICO" || true
     executar "Iniciando o serviço ${WEB_SERVICO}..." servico restart "$WEB_SERVICO"
     sleep 1
     sucesso "Servidor Web ${WEB^^} em execução. Diretório do site: ${WEB_ROOT}"
 }
 
 # ---------------------------------------------------------------------------
-# ETAPA 6 - Download e publicação do template HTML
+# ETAPA 7 - Download e publicação do template HTML
 # ---------------------------------------------------------------------------
 
 # Baixa e extrai o template. Retorna 0 e o diretório com o index.html em
@@ -898,7 +1152,7 @@ publicar_template() {
 }
 
 # ---------------------------------------------------------------------------
-# ETAPA 7 - Firewall
+# ETAPA 8 - Firewall
 # ---------------------------------------------------------------------------
 configurar_firewall() {
     titulo "Liberação das portas no firewall (DNS 53, HTTP 80, HTTPS 443)"
@@ -918,7 +1172,33 @@ configurar_firewall() {
 }
 
 # ---------------------------------------------------------------------------
-# ETAPA 8 - Resolvedor local (a própria máquina passa a usar este DNS)
+# ETAPA 9 - Inicialização automática dos serviços DNS e HTTP
+# ---------------------------------------------------------------------------
+habilitar_inicializacao() {
+    titulo "Inicialização automática dos serviços (DNS e Web) junto com o sistema"
+    local s
+    for s in "$BIND_SERVICO" "$WEB_SERVICO"; do
+        if tem_systemd; then
+            executar "Habilitando '${s}' no boot (systemctl enable ${s})..." systemctl enable "$s"
+            systemctl is-enabled --quiet "$s" \
+                && sucesso "Serviço '${s}': habilitado na inicialização." \
+                || { erro "Não foi possível habilitar '${s}' na inicialização."; exit 1; }
+        elif command -v update-rc.d >/dev/null; then
+            executar "Habilitando '${s}' no boot (update-rc.d ${s} defaults)..." update-rc.d "$s" defaults
+            sucesso "Serviço '${s}': habilitado na inicialização."
+        elif command -v chkconfig >/dev/null; then
+            executar "Habilitando '${s}' no boot (chkconfig ${s} on)..." chkconfig "$s" on
+            sucesso "Serviço '${s}': habilitado na inicialização."
+        else
+            aviso "Não foi possível identificar como habilitar '${s}' no boot."
+        fi
+    done
+}
+
+# ---------------------------------------------------------------------------
+# ETAPA 10 - Resolvedor local (a própria máquina consulta este DNS primeiro)
+#   Como o BIND não faz recursão, nomes da Internet recebem "REFUSED" e o
+#   sistema segue automaticamente para o próximo servidor DNS da lista.
 # ---------------------------------------------------------------------------
 configurar_resolver() {
     titulo "Configuração do resolvedor DNS local"
@@ -949,15 +1229,21 @@ EOF
             printf 'nameserver 127.0.0.1\n%s\n' "$original" >/etc/resolv.conf
         fi
         sucesso "127.0.0.1 adicionado como primeiro servidor DNS em /etc/resolv.conf."
+        # Mantém a configuração após reiniciar (o cliente DHCP reescreve o resolv.conf)
+        if [[ -f /etc/dhcp/dhclient.conf ]] && ! grep -q '^prepend domain-name-servers 127.0.0.1;' /etc/dhcp/dhclient.conf; then
+            fazer_backup /etc/dhcp/dhclient.conf
+            echo "prepend domain-name-servers 127.0.0.1;" >>/etc/dhcp/dhclient.conf
+            info "Configuração mantida após reiniciar (/etc/dhcp/dhclient.conf)."
+        fi
     fi
 }
 
 # ---------------------------------------------------------------------------
-# ETAPA 9 - Testes de validação
+# ETAPA 11 - Testes de validação (DNS, Web, segurança, rede e serviços)
 # ---------------------------------------------------------------------------
 testar() {
     titulo "Testes de validação"
-    local i nome tipo resposta falhas=0 codigo titulo_pagina
+    local i nome tipo resposta falhas=0 codigo titulo_pagina cabecalho s
 
     info "Consultando cada registro no servidor DNS local (dig @127.0.0.1)..."
     resposta=$(dig +short @127.0.0.1 "$DOMINIO" NS 2>/dev/null || true)
@@ -997,16 +1283,55 @@ testar() {
         fi
     fi
 
+    info "Testando os itens de segurança..."
+    # Transferência de zona deve ser recusada
+    resposta=$(dig @127.0.0.1 "$DOMINIO" AXFR +time=3 +tries=1 2>&1 || true)
+    if grep -qi 'Transfer failed' <<<"$resposta"; then
+        sucesso "Transferência de zona (AXFR) bloqueada."
+    else
+        aviso "A transferência de zona NÃO foi bloqueada."; falhas=$((falhas + 1))
+    fi
+    # Consultas recursivas (nomes de fora do domínio) devem ser recusadas
+    resposta=$(dig @127.0.0.1 www.google.com A +time=3 +tries=1 2>&1 | grep -o 'status: [A-Z]*' | head -n 1 || true)
+    if [[ $resposta == "status: REFUSED" ]]; then
+        sucesso "Consultas recursivas bloqueadas (www.google.com -> REFUSED)."
+    else
+        aviso "Consultas recursivas NÃO estão bloqueadas (${resposta:-sem resposta})."; falhas=$((falhas + 1))
+    fi
+    # Cabeçalho HTTP "Server" não pode exibir a versão
+    cabecalho=$(curl -sI --max-time 10 http://127.0.0.1/ | grep -i '^Server:' | tr -d '\r' || true)
+    if [[ -n $cabecalho && ! $cabecalho =~ [0-9] ]]; then
+        sucesso "Versão do servidor Web oculta (${cabecalho})."
+    else
+        aviso "Cabeçalho HTTP exibe a versão: '${cabecalho}'."; falhas=$((falhas + 1))
+    fi
+
+    info "Testando IP fixo e serviços..."
+    if ip -4 -o addr show dev "$IFACE" | grep -q "inet ${IP_SERVIDOR}/${MASCARA} "; then
+        sucesso "IP fixo ${IP_SERVIDOR}/${MASCARA} ativo em ${IFACE}."
+    else
+        aviso "IP fixo não encontrado em ${IFACE}."; falhas=$((falhas + 1))
+    fi
+    for s in "$BIND_SERVICO" "$WEB_SERVICO"; do
+        if servico_ativo "$s"; then sucesso "Serviço '${s}' em execução."
+        else aviso "Serviço '${s}' parado."; falhas=$((falhas + 1)); fi
+        if tem_systemd; then
+            if systemctl is-enabled --quiet "$s"; then sucesso "Serviço '${s}' habilitado no boot."
+            else aviso "Serviço '${s}' não está habilitado no boot."; falhas=$((falhas + 1)); fi
+        fi
+    done
+
+    FALHAS_TESTES=$falhas
     if (( falhas == 0 )); then sucesso "Todos os testes passaram."
     else aviso "${falhas} teste(s) com problema. Consulte o log: ${LOG}"; fi
 }
 
 #==============================================================================
-# 5. TAREFAS ADICIONAIS (DIA DA GLOBAL)
+# 5. TAREFAS ADICIONAIS (OPCIONAL)
 #    Para incluir uma nova tarefa:
 #      1) crie uma função seguindo o modelo abaixo (use titulo/info/executar);
 #      2) adicione o nome da função no vetor TAREFAS_EXTRAS.
-#    Elas serão executadas automaticamente depois dos testes, com a mesma
+#    Elas serão executadas automaticamente depois dos testes (antes do reboot), com a mesma
 #    numeração de etapas, log e tratamento de erros do restante do script.
 #==============================================================================
 TAREFAS_EXTRAS=(
@@ -1027,15 +1352,17 @@ TAREFAS_EXTRAS=(
 # 6. FLUXO PRINCIPAL
 #==============================================================================
 resumo_final() {
-    local ip=$IP_SERVIDOR
+    local ip=$IP_SERVIDOR cor=$VERDE msg="    INSTALAÇÃO CONCLUÍDA COM SUCESSO    "
+    if (( FALHAS_TESTES > 0 )); then cor=$AMARELO; msg="  INSTALAÇÃO CONCLUÍDA COM PENDÊNCIAS   "; fi
     cat <<EOF
 
-${VERDE}######################################################################
-#                    INSTALAÇÃO CONCLUÍDA COM SUCESSO                #
+${cor}######################################################################
+#              ${msg}              #
 ######################################################################${RESET}
 
   ${NEGRITO}Site:${RESET}             http://${DOMINIO}  |  http://www.${DOMINIO}  |  http://${ip}
-  ${NEGRITO}Servidor DNS:${RESET}     ${ip} (BIND - serviço '${BIND_SERVICO}')
+  ${NEGRITO}IP fixo:${RESET}          ${ip}/${MASCARA} na interface ${IFACE}
+  ${NEGRITO}Servidor DNS:${RESET}     ${ip} (BIND - serviço '${BIND_SERVICO}', sem recursão/transferência)
   ${NEGRITO}Servidor Web:${RESET}     ${WEB^^} (serviço '${WEB_SERVICO}') - raiz: ${WEB_ROOT}
   ${NEGRITO}Arquivo de zona:${RESET}  ${BIND_DIR_ZONAS}/db.${DOMINIO}
   ${NEGRITO}Log completo:${RESET}     ${LOG}
@@ -1050,6 +1377,31 @@ ${VERDE}######################################################################
     curl -I http://${DOMINIO}
 
 EOF
+}
+
+# ---------------------------------------------------------------------------
+# ETAPA 12 - Reinicialização do servidor (somente se tudo deu certo)
+#   Qualquer erro nas etapas anteriores já interrompe o script (set -e + trap),
+#   e falhas nos testes impedem o reboot.
+# ---------------------------------------------------------------------------
+reiniciar_servidor() {
+    titulo "Reinicialização do servidor"
+    if (( FALHAS_TESTES > 0 )); then
+        aviso "${FALHAS_TESTES} teste(s) falharam: o servidor NÃO será reiniciado."
+        aviso "Corrija os problemas (log: ${LOG}) e reinicie manualmente com: reboot"
+        exit 1
+    fi
+    sucesso "Instalação, configuração e testes concluídos com sucesso."
+    info "O servidor será reiniciado para validar a configuração. Pressione Ctrl+C para cancelar."
+    local s
+    for s in 10 9 8 7 6 5 4 3 2 1; do
+        printf '\r  Reiniciando em %2d segundo(s)... ' "$s"
+        sleep 1
+    done
+    echo
+    log "Reiniciando o servidor (reboot)."
+    sync
+    reboot
 }
 
 main() {
@@ -1067,17 +1419,19 @@ main() {
     confirmar "Deseja confirmar cada etapa antes de executá-la (modo passo a passo)?" n \
         && MODO_PASSO_A_PASSO="s"
 
-    TOTAL_ETAPAS=$(( 9 + ${#TAREFAS_EXTRAS[@]} ))
+    TOTAL_ETAPAS=$(( 12 + ${#TAREFAS_EXTRAS[@]} ))
 
-    verificar_ambiente     # Etapa 1
-    etapa_coleta           # Etapa 2
-    instalar_pacotes       # Etapa 3
-    configurar_bind        # Etapa 4
-    configurar_web         # Etapa 5
-    publicar_template      # Etapa 6
-    configurar_firewall    # Etapa 7
-    configurar_resolver    # Etapa 8
-    testar                 # Etapa 9
+    verificar_ambiente       # Etapa 1  - root, distribuição, Internet
+    etapa_coleta             # Etapa 2  - rede, domínio, registros, template
+    configurar_ip_fixo       # Etapa 3  - IP fixo (estático)
+    instalar_pacotes         # Etapa 4  - repositório do DVD (#), BIND e Apache/NGINX
+    configurar_bind          # Etapa 5  - zonas, sem recursão, sem transferência
+    configurar_web           # Etapa 6  - ServerTokens Prod / server_tokens off
+    publicar_template        # Etapa 7  - download e publicação do template
+    configurar_firewall      # Etapa 8  - portas 53, 80 e 443
+    habilitar_inicializacao  # Etapa 9  - DNS e HTTP no boot
+    configurar_resolver      # Etapa 10 - servidor usa o próprio DNS
+    testar                   # Etapa 11 - testes de tudo
 
     local tarefa
     for tarefa in "${TAREFAS_EXTRAS[@]}"; do
@@ -1085,7 +1439,8 @@ main() {
     done
 
     resumo_final
-    log "Fim da execução."
+    log "Fim da instalação."
+    reiniciar_servidor       # Etapa 12 - reboot somente se tudo deu certo
 }
 
 main "$@"
